@@ -45,31 +45,23 @@ struct NfcConfig {
 // Add/remove entries to support an arbitrary number of Doors or Lights!
 // ============================================================================
 
-// 1. Door Sensors (Inputs) - Infinite list supported!
-const DoorSensorConfig DOOR_SENSOR_CONFIGS[] = {
-    {"Front Door", 19, true, true, 50},  // Pin 19 (Main Door)
-    {"Back Door", 23, true, true, 50},   // Pin 23 (Secondary Door)
-    {"Garage Door", 15, true, true, 50}, // Pin 15 (Tertiary Door)
-};
+// 1. Door Sensors (Inputs) - Empty list (no door sensors)
+const DoorSensorConfig DOOR_SENSOR_CONFIGS[] = {};
 
-// 2. Lights / Relays (Outputs) - Infinite list supported!
-const LightConfig LIGHT_CONFIGS[] = {
-    {"Living Room Light", 18, true, 4, true}, // Relay Pin 18, Button Pin 4
-    {"Kitchen Light", 5, true, -1, true},     // Relay Pin 5, No button
-};
+// 2. Lights / Relays (Outputs) - Empty list (no lights)
+const LightConfig LIGHT_CONFIGS[] = {};
 
-// 3. Single PN532 NFC Module
+// 3. Single PN532 NFC Module (I2C only: SDA G38, SCL G39, no RST/IRQ)
 const NfcConfig NFC_MODULE_CONFIG = {
     true, // enabled
-    21,   // SDA Pin (GPIO 21)
-    22,   // SCL Pin (GPIO 22)
-    17,   // Reset Pin (GPIO 17)
-    16,   // IRQ Pin (GPIO 16)
+    38,   // SDA Pin (GPIO 38)
+    39,   // SCL Pin (GPIO 39)
+    -1,   // Reset Pin (-1: unconnected / I2C only)
+    -1,   // IRQ Pin (-1: unconnected / I2C only)
     200   // Polling interval (200 ms)
 };
 
 // 4. Status Indicator LED
-#define PIN_STATUS_LED                                                         \
-  2 // Built-in LED on standard ESP32 boards (-1 to disable)
+#define PIN_STATUS_LED -1 // Disabled (-1: no lights/status LED)
 
 #endif // CONFIG_H

@@ -95,6 +95,8 @@ void updateBTHomeAdvertising(bool forceFast = false) {
 
 void setup() {
     Serial.begin(115200);
+    unsigned long startTime = millis();
+    while (!Serial && (millis() - startTime < 2000));
     delay(500);
     Serial.println("\n==========================================");
     Serial.println("   Initializing ESP32 BTHome Node");

@@ -17,13 +17,71 @@ bool NfcPn532::begin() {
         return false;
     }
 
-    if (m_config.sdaPin >= 0 && m_config.sclPin >= 0) {
-        Wire.begin(m_config.sdaPin, m_config.sclPin);
-    } else {
-        Wire.begin();
+    // 1. Wake up PN532 from Hard Power Down if Reset pin is configured
+    if (m_config.resetPin >= 0) {
+        pinMode(m_config.resetPin, OUTPUT);
+        digitalWrite(m_config.resetPin, HIGH);
+        delay(10);
+        digitalWrite(m_config.resetPin, LOW);
+        delay(50);
+        digitalWrite(m_config.resetPin, HIGH);
+        delay(50);
+    }
+
+    struct PinPair { int sda; int scl; };
+    PinPair candidates[] = {
+        {m_config.sdaPin, m_config.sclPin},
+        {38, 39},
+        {39, 38},
+        {2, 1},
+        {1, 2},
+        {5, 6},
+        {6, 5},
+        {7, 8},
+        {8, 7}
+    };
+
+    bool found = false;
+    int activeSda = -1;
+    int activeScl = -1;
+
+    for (const auto& pair : candidates) {
+        if (pair.sda < 0 || pair.scl < 0) continue;
+
+        Wire.end(); // Reset I2C bus state
+        pinMode(pair.sda, INPUT_PULLUP);
+        pinMode(pair.scl, INPUT_PULLUP);
+        Wire.begin(pair.sda, pair.scl);
+        Wire.setClock(100000);
+        Wire.setTimeOut(1000);
+
+        for (uint8_t addr = 1; addr < 127; addr++) {
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission() == 0) {
+                Serial.printf("[I2C Scan] Device RESPONDED at address 0x%02X on SDA Pin %d, SCL Pin %d!\n", addr, pair.sda, pair.scl);
+                found = true;
+                activeSda = pair.sda;
+                activeScl = pair.scl;
+                break;
+            }
+        }
+        if (found) break;
+    }
+
+    if (!found) {
+        Serial.println("[PN532] Tested all pin pairs (38/39, 39/38, 2/1, 1/2, 5/6, 7/8). No I2C device responded.");
+        Serial.println("[PN532] Try toggling DIP Switch 1 (set to OFF) & Switch 2 (set to ON).");
+        m_initialized = false;
+        return false;
     }
     
     m_nfc.begin();
+    // Re-apply custom pins after m_nfc.begin() overrides Wire
+    if (activeSda >= 0 && activeScl >= 0) {
+        Wire.begin(activeSda, activeScl);
+        Wire.setClock(100000);
+        Wire.setTimeOut(1000);
+    }
 
     uint32_t versiondata = m_nfc.getFirmwareVersion();
     if (!versiondata) {
@@ -39,7 +97,7 @@ bool NfcPn532::begin() {
 
     // Configure board to read RFID tags
     m_nfc.SAMConfig();
-    m_nfc.setPassiveActivationRetries(0x01); // Quick non-blocking read retry count
+    m_nfc.setPassiveActivationRetries(0xFF); // Retry 255 times (~50ms) to energize tag antenna
 
     m_initialized = true;
     return true;
@@ -62,8 +120,14 @@ bool NfcPn532::pollTag(uint32_t &outUid32, uint8_t *outUidBytes, uint8_t &outUid
     uint8_t uid[7] = {0};
     uint8_t uidLength = 0;
 
-    // Attempt to detect passive ISO14443A tag (Mifare cards / tags) with 30ms non-blocking timeout
-    bool success = m_nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 30);
+    // Attempt to detect passive ISO14443A tag (Mifare cards / tags) with 100ms timeout
+    bool success = m_nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 100);
+
+    static uint32_t lastHeartbeat = 0;
+    if (millis() - lastHeartbeat > 5000) {
+        lastHeartbeat = millis();
+        Serial.println("[PN532] Reader active & listening for 13.56MHz NFC tags/cards...");
+    }
 
     if (success && uidLength > 0) {
         uint32_t currentUid32 = 0;
