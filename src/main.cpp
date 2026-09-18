@@ -5,20 +5,20 @@
 #include "config.h"
 #include "bthome_encoder.h"
 #include "door_sensor.h"
-#include "light_control.h"
-#include "nfc_pn532.h"
 
-// BTHome Service UUID
+#if ENABLE_PN532_NFC
+#include "nfc_manager.h"
+NfcManager* g_nfcManager = nullptr;
+#endif
+
+// BTHome Service UUID (0xFCD2)
 static const uint16_t BTHOME_SERVICE_UUID = 0xFCD2;
 
-// Calculate dynamic counts from config arrays
+// Calculate dynamic door sensor count from config array
 static const size_t NUM_DOOR_SENSORS = sizeof(DOOR_SENSOR_CONFIGS) / sizeof(DoorSensorConfig);
-static const size_t NUM_LIGHTS       = sizeof(LIGHT_CONFIGS) / sizeof(LightConfig);
 
-// Dynamic instances
+// Dynamic door sensor instances
 std::vector<DoorSensor*> g_doorSensors;
-std::vector<LightControl*> g_lights;
-NfcPn532 g_nfcModule(NFC_MODULE_CONFIG);
 
 // BLE Advertising state globals
 NimBLEAdvertising* pAdvertising = nullptr;
@@ -26,20 +26,15 @@ uint8_t g_packetId = 0;
 uint32_t g_lastAdvUpdate = 0;
 uint32_t g_currentAdvInterval = BTHOME_ADV_INTERVAL_MS;
 
-// NFC Tag State
-uint32_t g_lastNfcTagUid = 0;
-bool g_nfcTagActive = false;
-uint32_t g_nfcTagClearTime = 0;
-
 void updateBTHomeAdvertising(bool forceFast = false) {
     if (!pAdvertising) return;
 
     BTHomeEncoder encoder;
     
-    // Add Packet Sequence ID (0x00) for deduplication
+    // 1. Add Packet Sequence ID (0x00)
     encoder.addPacketId(g_packetId++);
 
-    // Add state of all Door Sensors (0x1A)
+    // 2. Add state of all Door Sensors (0x1A)
     for (size_t i = 0; i < g_doorSensors.size(); ++i) {
         if (!encoder.addDoorState(g_doorSensors[i]->isOpen())) {
             Serial.printf("[BLE] Warning: BTHome payload full, skipped Door #%d\n", i + 1);
@@ -47,21 +42,20 @@ void updateBTHomeAdvertising(bool forceFast = false) {
         }
     }
 
-    // Add state of all Lights (0x10)
-    for (size_t i = 0; i < g_lights.size(); ++i) {
-        if (!encoder.addLightState(g_lights[i]->isOn())) {
-            Serial.printf("[BLE] Warning: BTHome payload full, skipped Light #%d\n", i + 1);
-            break;
-        }
-    }
+#if ENABLE_PN532_NFC
+    // 3. Add Button Event (0x3A) and Tag UID (0x3E) if tag present
+    // NOTE: Added strictly in ascending Object ID order (0x00 < 0x1A < 0x3A < 0x3E)
+    if (g_nfcManager && g_nfcManager->isInitialized() && g_nfcManager->isTagPresent()) {
+        encoder.addButtonEvent(0x01); // Button press event (0x01) on NFC tap
 
-    // Add NFC tag event if active (0x3A & 0x0C)
-    if (g_nfcTagActive) {
-        encoder.addButtonEvent(0x01); // 0x01 = Button press / RFID Tag event
-        if (g_lastNfcTagUid != 0) {
-            encoder.addTagUid(g_lastNfcTagUid);
+        const auto& tag = g_nfcManager->getLastTag();
+        uint32_t uid32 = 0;
+        for (size_t k = 0; k < tag.uid.size() && k < 4; ++k) {
+            uid32 = (uid32 << 8) | tag.uid[k];
         }
+        encoder.addTagUid(uid32); // 4-byte uint32 count/ID (0x3E)
     }
+#endif
 
     // Build NimBLE Service Data
     NimBLEAdvertisementData advData;
@@ -85,6 +79,12 @@ void updateBTHomeAdvertising(bool forceFast = false) {
 
     g_lastAdvUpdate = millis();
     g_currentAdvInterval = forceFast ? BTHOME_FAST_ADV_INTERVAL_MS : BTHOME_ADV_INTERVAL_MS;
+
+    Serial.printf("[BLE Adv] Packet #%u | Length %zu bytes: ", g_packetId - 1, payloadLen);
+    for (size_t k = 0; k < payloadLen; ++k) {
+        Serial.printf("%02X ", payload[k]);
+    }
+    Serial.println();
 
 #if PIN_STATUS_LED >= 0
     digitalWrite(PIN_STATUS_LED, HIGH);
@@ -118,28 +118,21 @@ void setup() {
                       ds->isOpen() ? "OPEN" : "CLOSED");
     }
 
-    // 2. Initialize Light Controls
-    Serial.printf("[Init] Light Controls Count: %u\n", NUM_LIGHTS);
-    for (size_t i = 0; i < NUM_LIGHTS; ++i) {
-        LightControl* lc = new LightControl(LIGHT_CONFIGS[i]);
-        lc->begin();
-        g_lights.push_back(lc);
-        Serial.printf("  - Light #%u [%s] Relay Pin %u -> State: %s\n",
-                      i + 1, lc->getName(), lc->getRelayPin(),
-                      lc->isOn() ? "ON" : "OFF");
-    }
-
-    // 3. Initialize PN532 NFC Reader
-    if (g_nfcModule.isEnabled()) {
-        Serial.println("[Init] PN532 NFC Module enabled");
-        if (!g_nfcModule.begin()) {
-            Serial.println("[PN532] Warning: NFC Module initialization failed or not detected");
-        }
+#if ENABLE_PN532_NFC
+    // 2. Initialize Optional PN532 NFC Manager
+    Serial.printf("[Init] Initializing PN532 NFC Module (I2C SDA: %d, SCL: %d)\n",
+                  PN532_I2C_SDA, PN532_I2C_SCL);
+    g_nfcManager = new NfcManager(PN532_I2C_SDA, PN532_I2C_SCL, I2C_NUM_0, PN532_RESET_PIN);
+    if (!g_nfcManager->begin()) {
+        Serial.println("[Init] Note: PN532 NFC module not present or disabled.");
     } else {
-        Serial.println("[Init] PN532 NFC Module disabled in config");
+        Serial.println("[Init] PN532 NFC Module Initialized Successfully.");
     }
+#else
+    Serial.println("[Init] PN532 NFC Module Disabled in config.h.");
+#endif
 
-    // 4. Initialize NimBLE Advertising
+    // 3. Initialize NimBLE Advertising
     Serial.println("[Init] Starting NimBLE BLE Stack: " DEVICE_NAME);
     NimBLEDevice::init(DEVICE_NAME);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9); // +9dBm Max TX Power
@@ -164,38 +157,21 @@ void loop() {
         }
     }
 
-    // 2. Poll all Light Controls & Physical Buttons
-    for (size_t i = 0; i < g_lights.size(); ++i) {
-        if (g_lights[i]->update()) {
-            Serial.printf("[Event] Light #%u [%s] -> %s\n",
-                          i + 1, g_lights[i]->getName(),
-                          g_lights[i]->isOn() ? "ON" : "OFF");
-            stateChanged = true;
+#if ENABLE_PN532_NFC
+    // 2. Poll Optional PN532 NFC Reader
+    if (g_nfcManager && g_nfcManager->isInitialized() && g_nfcManager->update()) {
+        if (g_nfcManager->isTagPresent()) {
+            Serial.printf("[Event] NFC Tag Tapped! Type: %d, UID/IDm: %s\n",
+                          static_cast<int>(g_nfcManager->getLastTag().type),
+                          g_nfcManager->getTagUidString().c_str());
+        } else {
+            Serial.println("[Event] NFC Tag Removed.");
         }
+        stateChanged = true;
     }
+#endif
 
-    // 3. Poll PN532 NFC Module
-    if (g_nfcModule.isEnabled()) {
-        uint32_t scannedUid = 0;
-        uint8_t uidBytes[7] = {0};
-        uint8_t uidLen = 0;
-
-        if (g_nfcModule.pollTag(scannedUid, uidBytes, uidLen)) {
-            Serial.printf("[Event] PN532 NFC Tag Scanned! Hex UID: 0x%08X\n", scannedUid);
-            g_lastNfcTagUid = scannedUid;
-            g_nfcTagActive = true;
-            g_nfcTagClearTime = millis() + 3000; // Keep tag event active for 3s
-            stateChanged = true;
-        }
-
-        if (g_nfcTagActive && millis() > g_nfcTagClearTime) {
-            g_nfcTagActive = false;
-            g_lastNfcTagUid = 0;
-            stateChanged = true;
-        }
-    }
-
-    // 4. Update BLE Advertisement if state changed or interval elapsed
+    // 3. Update BLE Advertisement if state changed or interval elapsed
     if (stateChanged) {
         updateBTHomeAdvertising(true);
     } else if (millis() - g_lastAdvUpdate >= g_currentAdvInterval) {
